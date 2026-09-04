@@ -1,0 +1,12 @@
+{
+  "expo": {
+    "name": "Zoomable Image Viewer",
+    "slug": "react-native-zoomable-image-viewer-demo",
+    "version": "1.0.0",
+    "orientation": "default",
+    "userInterfaceStyle": "light",
+    "android": {
+      "edgeToEdgeEnabled": true
+    }
+  }
+}
