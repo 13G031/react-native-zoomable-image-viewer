@@ -13,16 +13,25 @@ import {
   type StyleProp,
   type ViewStyle,
 } from "react-native";
-import { Gesture, GestureDetector } from "react-native-gesture-handler";
+import { Gesture, GestureDetector, GestureHandlerRootView, PointerType } from "react-native-gesture-handler";
 import Animated, {
-  runOnJS,
+  cancelAnimation,
   useAnimatedStyle,
   useSharedValue,
+  withDecay,
   withSpring,
   withTiming,
 } from "react-native-reanimated";
 
-import { clamp, fitContainedSize, getPanBounds } from "./geometry";
+import type { SharedValue } from "react-native-reanimated";
+import { scheduleOnRN, scheduleOnUI } from "react-native-worklets";
+
+import { clamp, clampPhotoOffset, dragPhotoOffset, fitContainedSize, photoPanLimit, zoomPhotoAtPoint } from "./geometry";
+
+const TAP_DISTANCE = 10;
+const PAN_SPEED = 1;
+const EDGE_SPRING = { stiffness: 100, damping: 20, mass: 1, overshootClamping: true };
+const ZOOM_TIMING = { duration: 320 };
 
 type ZoomableImageViewerProps = {
   source: ImageSourcePropType;
@@ -49,173 +58,181 @@ export function ZoomableImageViewer({
   const [isOpen, setIsOpen] = useState(false);
   const [aspectRatio, setAspectRatio] = useState(1);
 
-  const scale = useSharedValue(minScale);
-  const savedScale = useSharedValue(minScale);
-  const translateX = useSharedValue(0);
-  const translateY = useSharedValue(0);
-  const savedTranslateX = useSharedValue(0);
-  const savedTranslateY = useSharedValue(0);
-
+  const viewport = { width: viewportWidth, height: viewportHeight };
+  const restingZoom = { scale: minScale, x: 0, y: 0 };
   const containedSize = useMemo(
     () => fitContainedSize(viewportWidth, viewportHeight, aspectRatio),
     [aspectRatio, viewportHeight, viewportWidth]
   );
+  const ready = containedSize.width > 0 && containedSize.height > 0;
+  const zoomScale = useSharedValue(minScale);
+  const translateX = useSharedValue(0);
+  const translateY = useSharedValue(0);
+  const pinchStart = useSharedValue({ zoom: restingZoom, focal: { x: 0, y: 0 }, gestureScale: 1, pointers: 2 });
+  const panTracking = useSharedValue({ scale: minScale, translationX: 0, translationY: 0 });
+  const hasPanMotion = useSharedValue(false);
 
-  const reset = (animated: boolean) => {
-    const next = animated ? withTiming(minScale) : minScale;
-    scale.value = next;
-    savedScale.value = minScale;
-    translateX.value = animated ? withSpring(0) : 0;
-    translateY.value = animated ? withSpring(0) : 0;
-    savedTranslateX.value = 0;
-    savedTranslateY.value = 0;
+  const stopMotion = () => {
+    "worklet";
+    hasPanMotion.set(false);
+    cancelAnimation(zoomScale);
+    cancelAnimation(translateX);
+    cancelAnimation(translateY);
+  };
+
+  const reset = () => {
+    stopMotion();
+    zoomScale.set(minScale);
+    translateX.set(0);
+    translateY.set(0);
   };
 
   const close = () => {
-    reset(false);
+    reset();
     setIsOpen(false);
   };
 
   const open = () => {
-    reset(false);
+    reset();
     setIsOpen(true);
   };
 
   useEffect(() => {
-    reset(false);
-  }, [viewportHeight, viewportWidth]);
+    reset();
+  }, [minScale, viewportHeight, viewportWidth]);
+
+  const releaseAxis = (position: SharedValue<number>, velocity: number, imageLength: number, viewportLength: number) => {
+    "worklet";
+    const offset = position.get();
+    const scale = zoomScale.get();
+    const limit = photoPanLimit(imageLength, viewportLength, scale);
+    if (scale <= minScale || limit === 0) {
+      position.set(0);
+      return;
+    }
+    const edge = clampPhotoOffset(offset, imageLength, viewportLength, scale);
+    if (offset !== edge) {
+      position.set(withSpring(edge, EDGE_SPRING));
+      return;
+    }
+    if (velocity === 0) return;
+    const overscroll = Math.min(viewportLength * 0.06, limit);
+    position.set(withDecay({
+      velocity: Math.max(-1800, Math.min(velocity * 0.65, 1800)),
+      deceleration: 0.996,
+      // Bound fast flicks before returning to the image edge.
+      clamp: [-limit - overscroll, limit + overscroll],
+    }, (finished) => {
+      if (!finished) return;
+      const current = position.get();
+      const target = clampPhotoOffset(current, imageLength, viewportLength, scale);
+      if (current !== target) position.set(withSpring(target, EDGE_SPRING));
+    }));
+  };
+
+  const releasePan = (velocityX: number, velocityY: number) => {
+    "worklet";
+    hasPanMotion.set(true);
+    releaseAxis(translateX, velocityX, containedSize.width, viewport.width);
+    releaseAxis(translateY, velocityY, containedSize.height, viewport.height);
+  };
+
+  const toggleZoom = (x: number, y: number) => {
+    "worklet";
+    if (!ready) return;
+    stopMotion();
+    const target = zoomScale.get() > minScale ? restingZoom : zoomPhotoAtPoint(restingZoom, clamp(doubleTapScale, minScale, maxScale), { x, y }, viewport, containedSize);
+    zoomScale.set(withTiming(target.scale, ZOOM_TIMING));
+    translateX.set(withTiming(target.x, ZOOM_TIMING));
+    translateY.set(withTiming(target.y, ZOOM_TIMING));
+  };
 
   const doubleTap = Gesture.Tap()
     .numberOfTaps(2)
-    .maxDuration(250)
+    .maxDelay(300)
+    .maxDistance(TAP_DISTANCE)
     .onEnd((event, success) => {
-      if (!success) return;
-
-      if (scale.value > minScale + 0.01) {
-        scale.value = withTiming(minScale);
-        savedScale.value = minScale;
-        translateX.value = withSpring(0);
-        translateY.value = withSpring(0);
-        savedTranslateX.value = 0;
-        savedTranslateY.value = 0;
-        return;
-      }
-
-      const targetScale = clamp(doubleTapScale, minScale, maxScale);
-      const bounds = getPanBounds(
-        containedSize.width,
-        containedSize.height,
-        targetScale,
-        viewportWidth,
-        viewportHeight
-      );
-      const targetX = clamp(
-        (viewportWidth / 2 - event.x) * (targetScale - 1),
-        -bounds.x,
-        bounds.x
-      );
-      const targetY = clamp(
-        (viewportHeight / 2 - event.y) * (targetScale - 1),
-        -bounds.y,
-        bounds.y
-      );
-
-      scale.value = withTiming(targetScale);
-      savedScale.value = targetScale;
-      translateX.value = withSpring(targetX);
-      translateY.value = withSpring(targetY);
-      savedTranslateX.value = targetX;
-      savedTranslateY.value = targetY;
+      if (success) toggleZoom(event.x, event.y);
     });
 
   const singleTap = Gesture.Tap()
-    .numberOfTaps(1)
-    .maxDistance(10)
+    .maxDistance(TAP_DISTANCE)
     .onEnd((_event, success) => {
-      if (success && scale.value <= minScale + 0.01) {
-        runOnJS(close)();
-      }
+      if (success) scheduleOnRN(close);
     });
 
+  const savePinchStart = (event: { scale: number; focalX: number; focalY: number; numberOfPointers: number }) => {
+    "worklet";
+    pinchStart.value = {
+      zoom: { scale: zoomScale.get(), x: translateX.get(), y: translateY.get() },
+      focal: { x: event.focalX, y: event.focalY },
+      gestureScale: event.scale,
+      pointers: event.numberOfPointers,
+    };
+  };
+
   const pinch = Gesture.Pinch()
-    .onStart(() => {
-      savedScale.value = scale.value;
+    .enabled(ready)
+    .onStart((event) => {
+      stopMotion();
+      savePinchStart(event);
     })
     .onUpdate((event) => {
-      scale.value = clamp(savedScale.value * event.scale, minScale, maxScale);
-    })
-    .onEnd(() => {
-      if (scale.value <= minScale + 0.01) {
-        scale.value = withTiming(minScale);
-        savedScale.value = minScale;
-        translateX.value = withSpring(0);
-        translateY.value = withSpring(0);
-        savedTranslateX.value = 0;
-        savedTranslateY.value = 0;
+      const start = pinchStart.value;
+      // A changed finger count moves the reported focal point without moving the photo.
+      if (event.numberOfPointers !== start.pointers) {
+        savePinchStart(event);
         return;
       }
-
-      const bounds = getPanBounds(
-        containedSize.width,
-        containedSize.height,
-        scale.value,
-        viewportWidth,
-        viewportHeight
-      );
-      const nextX = clamp(translateX.value, -bounds.x, bounds.x);
-      const nextY = clamp(translateY.value, -bounds.y, bounds.y);
-      translateX.value = withSpring(nextX);
-      translateY.value = withSpring(nextY);
-      savedTranslateX.value = nextX;
-      savedTranslateY.value = nextY;
-      savedScale.value = scale.value;
+      if (event.numberOfPointers < 2 && event.pointerType !== PointerType.MOUSE) return;
+      const scale = clamp(start.zoom.scale * event.scale / start.gestureScale, minScale, maxScale);
+      const focal = {
+        x: event.focalX,
+        y: event.focalY,
+      };
+      const target = scale <= minScale ? restingZoom : zoomPhotoAtPoint(start.zoom, scale, start.focal, viewport, containedSize, focal, true);
+      zoomScale.set(target.scale);
+      translateX.set(target.x);
+      translateY.set(target.y);
+    })
+    .onEnd(() => {
+      releasePan(0, 0);
     });
 
   const pan = Gesture.Pan()
     .maxPointers(1)
-    .onStart(() => {
-      savedTranslateX.value = translateX.value;
-      savedTranslateY.value = translateY.value;
+    .minDistance(TAP_DISTANCE)
+    .onBegin(() => {
+      if (hasPanMotion.get()) stopMotion();
+    })
+    .onStart((event) => {
+      stopMotion();
+      panTracking.value = {
+        scale: zoomScale.get(),
+        translationX: event.translationX,
+        translationY: event.translationY,
+      };
     })
     .onUpdate((event) => {
-      if (scale.value <= minScale) return;
-
-      const bounds = getPanBounds(
-        containedSize.width,
-        containedSize.height,
-        scale.value,
-        viewportWidth,
-        viewportHeight
-      );
-      translateX.value = clamp(
-        savedTranslateX.value + event.translationX,
-        -bounds.x,
-        bounds.x
-      );
-      translateY.value = clamp(
-        savedTranslateY.value + event.translationY,
-        -bounds.y,
-        bounds.y
-      );
+      const { scale, translationX, translationY } = panTracking.value;
+      if (scale <= minScale) return;
+      translateX.set(dragPhotoOffset(translateX.get(), (event.translationX - translationX) * PAN_SPEED, containedSize.width, viewport.width, scale));
+      translateY.set(dragPhotoOffset(translateY.get(), (event.translationY - translationY) * PAN_SPEED, containedSize.height, viewport.height, scale));
+      panTracking.value = { scale, translationX: event.translationX, translationY: event.translationY };
     })
-    .onEnd(() => {
-      savedTranslateX.value = translateX.value;
-      savedTranslateY.value = translateY.value;
+    .onEnd((event, success) => {
+      const verticalDistance = Math.abs(event.translationY);
+      if (success && panTracking.value.scale <= minScale && verticalDistance > 60 && verticalDistance > Math.abs(event.translationX)) {
+        scheduleOnRN(close);
+      }
+      if (panTracking.value.scale > minScale) {
+        releasePan(success ? event.velocityX : 0, success ? event.velocityY : 0);
+      }
     });
 
-  const gesture = Gesture.Simultaneous(
-    pinch,
-    pan,
-    Gesture.Exclusive(doubleTap, singleTap)
-  );
-
-  const animatedStyle = useAnimatedStyle(() => ({
-    transform: [
-      { translateX: translateX.value },
-      { translateY: translateY.value },
-      { scale: scale.value },
-    ],
-  }));
+  const animatedStyle = useAnimatedStyle(() => {
+    return { transform: [{ translateX: translateX.get() }, { translateY: translateY.get() }, { scale: zoomScale.get() }] };
+  });
 
   const updateAspectRatio = (width?: number, height?: number) => {
     if (width && height) setAspectRatio(width / height);
@@ -251,17 +268,25 @@ export function ZoomableImageViewer({
         visible={isOpen}
       >
         <StatusBar backgroundColor={backgroundColor} barStyle="light-content" />
-        <View style={[styles.backdrop, { backgroundColor }]}>
-          <GestureDetector gesture={gesture}>
-            <Animated.View style={[styles.gestureSurface, animatedStyle]}>
-              <Animated.Image
-                accessible
-                accessibilityLabel={accessibilityLabel}
-                resizeMode="contain"
-                source={source}
-                style={containedSize}
-              />
-            </Animated.View>
+        <GestureHandlerRootView style={[styles.backdrop, { backgroundColor }]} accessibilityViewIsModal>
+          <GestureDetector gesture={Gesture.Race(pinch, pan, Gesture.Exclusive(doubleTap, singleTap))}>
+            <View collapsable={false} style={styles.gestureSurface}>
+              <Animated.View style={animatedStyle}>
+                <Image
+                  accessible
+                  accessibilityLabel={accessibilityLabel}
+                  accessibilityActions={[{ name: "activate", label: "Toggle zoom" }]}
+                  onAccessibilityAction={({ nativeEvent }) => {
+                    if (nativeEvent.actionName === "activate") {
+                      scheduleOnUI(toggleZoom, viewportWidth / 2, viewportHeight / 2);
+                    }
+                  }}
+                  resizeMode="contain"
+                  source={source}
+                  style={containedSize}
+                />
+              </Animated.View>
+            </View>
           </GestureDetector>
 
           <Pressable
@@ -273,7 +298,7 @@ export function ZoomableImageViewer({
           >
             <Text style={styles.closeText}>Close</Text>
           </Pressable>
-        </View>
+        </GestureHandlerRootView>
       </Modal>
     </>
   );
@@ -300,6 +325,7 @@ const styles = StyleSheet.create({
   },
   gestureSurface: {
     flex: 1,
+    overflow: "hidden",
     alignItems: "center",
     justifyContent: "center",
   },
